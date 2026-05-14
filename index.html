@@ -39,6 +39,7 @@ const PROD_KEYWORDS = ['producción','produccion','montaje','desarme','concluido
 const EXCLUDE_EXACT = ['ajustes odoo','interno','prueba nano','temporales (copia)'];
 const EXCLUDE_STARTS = ['temporales (n','permanentes (n','otros (n'];
 let prodStageIds = new Set();
+let prodProjectIds = new Set(); // proyectos que tienen tareas en etapas de producción
 
 const STATUS_OPTIONS = [
   { value: 'pending',     label: 'Pendiente',    color: '#5a5856' },
@@ -106,6 +107,21 @@ function getLocal(taskId) {
 }
 
 // ── Inicio ────────────────────────────────────────────────────────────────────
+async function detectProdProjects() {
+  try {
+    const allT = await apiFetch('get_tasks', {});
+    prodProjectIds = new Set();
+    (allT || []).forEach(t => {
+      if (t.stage_id && prodStageIds.has(t.stage_id[0]) && t.project_id) {
+        prodProjectIds.add(t.project_id[0]);
+      }
+    });
+  } catch(e) {
+    console.warn('No se pudo detectar proyectos en producción:', e.message);
+    prodProjectIds = new Set(); // si falla, mostrar todos
+  }
+}
+
 async function iniciar() {
   setSyncState('loading');
   try {
@@ -118,6 +134,8 @@ async function iniciar() {
     allStages.forEach(s => {
       if (PROD_KEYWORDS.some(k=>(s.name||'').toLowerCase().includes(k))) prodStageIds.add(s.id);
     });
+    // Cargar todas las tareas para saber qué proyectos tienen tareas en prod
+    await detectProdProjects();
     await loadLocalData();
     renderSidebar();
     setSyncState('ok');
@@ -145,12 +163,15 @@ function renderSidebar() {
     const n = (p.name||'').toLowerCase();
     if (EXCLUDE_EXACT.includes(n)) return false;
     if (EXCLUDE_STARTS.some(s=>n.startsWith(s))) return false;
+    // Solo mostrar proyectos que están en etapa de producción/postventa
+    // Usar last_update_status o filtrar por proyectos con tareas en prod
+    const status = p.last_update_status || '';
+    // Excluir proyectos cerrados/sin definir si no están en lista de prod activos
+    if (prodProjectIds.size > 0 && !prodProjectIds.has(p.id)) return false;
     return true;
   }).sort((a,b) => (parseInt(b.name)||0)-(parseInt(a.name)||0));
 
   if (searchQuery) projs = projs.filter(p=>(p.name||'').toLowerCase().includes(searchQuery.toLowerCase()));
-  // Nota: mostramos todos los proyectos numerados; el filtro "En producción" 
-  // dentro de cada proyecto ya oculta lo que no es producción
 
   el.innerHTML = projs.map(p => {
     const active = activeProjectId===p.id?'active':'';
