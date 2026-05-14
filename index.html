@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Animal — Producción</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, doc, getDoc, setDoc, collection, getDocs } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCaSN_GbufLckha8uSvpR81xiKNo77-tBY",
+  authDomain: "animal-produccion.firebaseapp.com",
+  projectId: "animal-produccion",
+  storageBucket: "animal-produccion.firebasestorage.app",
+  messagingSenderId: "699066115868",
+  appId: "1:699066115868:web:f164a5665c80ecde537cd9",
+  measurementId: "G-FHJKEG31MS"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// ── Estado global ─────────────────────────────────────────────────────────────
+let allProjects = [];
+let allStages = [];
+let allTasks = [];
+let localData = {}; // datos locales de Firebase por task_id
+let activeProjectId = null;
+let activeStageFilter = 'prod';
+let editingTask = null;
+let searchQuery = '';
+let currentUser = null;
+
+const PROD_KEYWORDS = ['producción','produccion','montaje','desarme','concluido','post venta','postventa','después','despues'];
+const EXCLUDE_EXACT = ['ajustes odoo','interno','prueba nano','temporales (copia)'];
+const EXCLUDE_STARTS = ['temporales (n','permanentes (n','otros (n'];
+let prodStageIds = new Set();
+
+const STATUS_OPTIONS = [
+  { value: 'pending',     label: 'Pendiente',    color: '#5a5856' },
+  { value: 'in_progress', label: 'En proceso',   color: '#f4c25a' },
+  { value: 'done',        label: 'Listo',         color: '#7ee8a2' },
+  { value: 'blocked',     label: 'Bloqueado',     color: '#f56b5c' },
+];
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  currentUser = user;
+  if (user) {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'grid';
+    document.getElementById('user-name').textContent = user.displayName?.split(' ')[0] || user.email;
+    iniciar();
+  } else {
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('app').style.display = 'none';
+  }
+});
+
+window.loginGoogle = async () => {
+  try {
+    await signInWithPopup(auth, new GoogleAuthProvider());
+  } catch(e) { alert('Error al iniciar sesión: ' + e.message); }
+};
+
+window.logout = async () => {
+  await signOut(auth);
+};
+
+// ── Odoo API ──────────────────────────────────────────────────────────────────
+async function apiFetch(action, params={}) {
+  const res = await fetch('/api/odoo', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action,...params})
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error);
+  return data.data || [];
+}
+
+// ── Firebase local data ───────────────────────────────────────────────────────
+async function loadLocalData() {
+  try {
+    const snap = await getDocs(collection(db, 'task_overrides'));
+    localData = {};
+    snap.forEach(d => { localData[d.id] = d.data(); });
+  } catch(e) { console.warn('Firebase load error:', e.message); }
+}
+
+async function saveLocalTask(taskId, fields) {
+  try {
+    const ref = doc(db, 'task_overrides', String(taskId));
+    const existing = localData[taskId] || {};
+    const merged = { ...existing, ...fields, updatedAt: new Date().toISOString() };
+    await setDoc(ref, merged);
+    localData[taskId] = merged;
+  } catch(e) { showToast('Error guardando: '+e.message, true); }
+}
+
+function getLocal(taskId) {
+  return localData[String(taskId)] || {};
+}
+
+// ── Inicio ────────────────────────────────────────────────────────────────────
+async function iniciar() {
+  setSyncState('loading');
+  try {
+    [allProjects, allStages] = await Promise.all([
+      apiFetch('get_projects'),
+      apiFetch('get_stages')
+    ]);
+    allStages = allStages.sort((a,b)=>(a.sequence||0)-(b.sequence||0));
+    prodStageIds = new Set();
+    allStages.forEach(s => {
+      if (PROD_KEYWORDS.some(k=>(s.name||'').toLowerCase().includes(k))) prodStageIds.add(s.id);
+    });
+    await loadLocalData();
+    renderSidebar();
+    setSyncState('ok');
+  } catch(e) { setSyncState('error'); showToast('Error: '+e.message, true); }
+}
+
+window.recargar = async () => {
+  await iniciar();
+  if (activeProjectId) await cargarTareas(activeProjectId);
+};
+
+async function cargarTareas(projId) {
+  setSyncState('loading');
+  try {
+    allTasks = await apiFetch('get_tasks', {project_id: projId});
+    renderProject();
+    setSyncState('ok');
+  } catch(e) { setSyncState('error'); showToast('Error: '+e.message, true); }
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+function renderSidebar() {
+  const el = document.getElementById('proj-list');
+  let projs = allProjects.filter(p => {
+    const n = (p.name||'').toLowerCase();
+    if (EXCLUDE_EXACT.includes(n)) return false;
+    if (EXCLUDE_STARTS.some(s=>n.startsWith(s))) return false;
+    return true;
+  }).sort((a,b) => (parseInt(b.name)||0)-(parseInt(a.name)||0));
+
+  if (searchQuery) projs = projs.filter(p=>(p.name||'').toLowerCase().includes(searchQuery.toLowerCase()));
+
+  el.innerHTML = projs.map(p => {
+    const active = activeProjectId===p.id?'active':'';
+    return `<div class="proj-item ${active}" onclick="selectProj(${p.id})">
+      <span class="proj-name">${p.name}</span>
+      <span class="proj-badge">${p.task_count||0}</span>
+    </div>`;
+  }).join('') || '<div style="padding:10px 12px;font-family:var(--mono);font-size:10px;color:var(--muted);">Sin proyectos</div>';
+}
+
+window.filtrarProyectos = q => { searchQuery=q; renderSidebar(); };
+
+window.selectProj = async id => {
+  activeProjectId = id;
+  activeStageFilter = 'prod';
+  renderSidebar();
+  document.getElementById('no-proj').style.display = 'none';
+  const pv = document.getElementById('proj-view');
+  pv.style.cssText = 'display:flex;flex:1;flex-direction:column;overflow:hidden;';
+  const proj = allProjects.find(p=>p.id===id);
+  document.getElementById('pv-title').textContent = proj?.name||'';
+  renderProjMeta(proj);
+  document.getElementById('list-body').innerHTML = '<div class="empty"><div class="spinner"></div><span>Cargando...</span></div>';
+  document.getElementById('kanban-board').innerHTML = '';
+  await cargarTareas(id);
+};
+
+function renderProjMeta(proj) {
+  if (!proj) return;
+  const sm = {on_track:['En tiempo','ok'],at_risk:['En riesgo','warn'],off_track:['Con problemas','bad'],done:['Finalizado','ok'],to_define:['—','']};
+  const [label,cls] = sm[proj.last_update_status]||['—',''];
+  const partner = proj.partner_id&&proj.partner_id!==false?(Array.isArray(proj.partner_id)?proj.partner_id[1]:proj.partner_id):null;
+  let html = `<span class="meta-chip ${cls}">${label}</span>`;
+  if (partner) html += `<span class="meta-chip">Cliente: ${partner}</span>`;
+  document.getElementById('pv-meta').innerHTML = html;
+}
+
+// ── Filters & KPIs ────────────────────────────────────────────────────────────
+function filteredTasks() {
+  if (activeStageFilter==='all') return allTasks;
+  if (activeStageFilter==='prod') return allTasks.filter(t=>t.stage_id&&prodStageIds.has(t.stage_id[0]));
+  return allTasks.filter(t=>t.stage_id&&t.stage_id[0]===activeStageFilter);
+}
+
+function renderStageFilter() {
+  const el = document.getElementById('stage-filter');
+  const present = new Set(allTasks.map(t=>t.stage_id?.[0]).filter(Boolean));
+  const stages = allStages.filter(s=>present.has(s.id));
+  let html = `<button class="sf-btn ${activeStageFilter==='all'?'active':''}" onclick="setFilter('all')">Todas</button>`;
+  html += `<button class="sf-btn ${activeStageFilter==='prod'?'active':''}" onclick="setFilter('prod')">En producción</button>`;
+  stages.forEach(s=>{ html+=`<button class="sf-btn ${activeStageFilter===s.id?'active':''}" onclick="setFilter(${s.id})">${s.name}</button>`; });
+  el.innerHTML = html;
+}
+
+window.setFilter = val => { activeStageFilter=val; renderStageFilter(); renderListView(); renderKanbanView(); updateKPIs(); };
+
+function updateKPIs() {
+  const prod = allTasks.filter(t=>t.stage_id&&prodStageIds.has(t.stage_id[0]));
+  const now = new Date();
+  const over = prod.filter(t=>{
+    const loc = getLocal(t.id);
+    const dl = loc.deadline || t.date_deadline;
+    return dl && new Date(dl) < now;
+  });
+  const done = prod.filter(t=>{
+    const loc = getLocal(t.id);
+    return loc.status==='done' || (allStages.find(s=>s.id===t.stage_id?.[0])?.fold);
+  });
+  document.getElementById('k-total').textContent = prod.length;
+  document.getElementById('k-ok').textContent = done.length;
+  document.getElementById('k-prog').textContent = Math.max(0,prod.length-done.length-over.length);
+  document.getElementById('k-over').textContent = over.length;
+}
+
+function renderProject() {
+  renderStageFilter(); updateKPIs(); renderListView(); renderKanbanView();
+}
+
+// ── Lista ─────────────────────────────────────────────────────────────────────
+function renderListView() {
+  const tasks = filteredTasks();
+  const el = document.getElementById('list-body');
+  if (!tasks.length) { el.innerHTML='<div class="empty"><span>Sin tareas en esta etapa</span></div>'; return; }
+
+  const groups = {};
+  tasks.forEach(t=>{
+    const sid=t.stage_id?.[0]; const sname=t.stage_id?.[1]||'Sin etapa';
+    if(!groups[sid]) groups[sid]={name:sname,tasks:[],id:sid};
+    groups[sid].tasks.push(t);
+  });
+  const ordered = allStages.filter(s=>groups[s.id]).map(s=>groups[s.id]);
+  const now = new Date();
+
+  el.innerHTML = ordered.map(g=>{
+    const dc=getStageDotClass(g.name);
+    return `<div class="stage-group">
+      <div class="stage-group-hdr">
+        <div class="stage-dot ${dc}"></div>
+        <span class="stage-lbl">${g.name}</span>
+        <span class="stage-cnt">${g.tasks.length}</span>
+      </div>
+      ${g.tasks.map(t=>renderTaskRow(t,now)).join('')}
+    </div>`;
+  }).join('');
+}
+
+function renderTaskRow(t, now) {
+  const loc = getLocal(t.id);
+  const deadline = loc.deadline || t.date_deadline;
+  const dl = deadline ? new Date(deadline) : null;
+  const days = dl ? Math.ceil((dl-now)/86400000) : null;
+  const dc = days!==null?(days<0?'overdue':days<=3?'soon':''):'';
+  const dateStr = dl ? fmtDate(dl) : '—';
+  const sub = t.subtask_count||(t.child_ids?.length)||0;
+  const status = loc.status || 'pending';
+  const statusObj = STATUS_OPTIONS.find(s=>s.value===status)||STATUS_OPTIONS[0];
+  const resp = loc.responsable || '—';
+  const rowCls = status==='blocked'?'blocked':status==='done'?'done':days!==null&&days<0?'overdue':t.priority==='1'?'prio':'';
+
+  return `<div class="task-row ${rowCls}" onclick="openModal(${t.id})">
+    <div class="tname">${t.name}${loc.notas?'<span class="has-note">✎</span>':''}</div>
+    <div style="display:flex;align-items:center;gap:5px;">
+      <div class="status-pill" style="background:${statusObj.color}22;color:${statusObj.color};border:1px solid ${statusObj.color}44;">${statusObj.label}</div>
+    </div>
+    <div class="tdates ${dc}">${dateStr}</div>
+    <div class="tresp">${resp}</div>
+    <div class="tsub ${sub>0?'has':''}">${sub>0?'✓ '+sub:'—'}</div>
+  </div>`;
+}
+
+// ── Kanban ────────────────────────────────────────────────────────────────────
+function renderKanbanView() {
+  const tasks = filteredTasks();
+  const board = document.getElementById('kanban-board');
+  const present = new Set(tasks.map(t=>t.stage_id?.[0]).filter(Boolean));
+  const cols = allStages.filter(s=>present.has(s.id));
+  if (!cols.length) { board.innerHTML='<div class="empty"><span>Sin tareas</span></div>'; return; }
+  const now = new Date();
+
+  board.innerHTML = cols.map(stage=>{
+    const st = tasks.filter(t=>t.stage_id?.[0]===stage.id);
+    const bar = getStageDotClass(stage.name).replace('sd-','bar-');
+    return `<div class="kcol">
+      <div class="kcol-hdr">
+        <div class="kcol-title">
+          <span>${stage.name}</span>
+          <span class="kcol-cnt">${st.length}</span>
+        </div>
+        <div class="kcol-bar ${bar}"></div>
+      </div>
+      <div class="kcol-body">
+        ${st.length?st.map(t=>renderKCard(t,now)).join(''):'<div class="kcol-empty">vacío</div>'}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderKCard(t, now) {
+  const loc = getLocal(t.id);
+  const deadline = loc.deadline || t.date_deadline;
+  const dl = deadline ? new Date(deadline) : null;
+  const days = dl ? Math.ceil((dl-now)/86400000) : null;
+  const dc = days!==null?(days<0?'overdue':days<=3?'soon':''):'';
+  const sub = t.subtask_count||(t.child_ids?.length)||0;
+  const status = loc.status||'pending';
+  const statusObj = STATUS_OPTIONS.find(s=>s.value===status)||STATUS_OPTIONS[0];
+  const cls = status==='blocked'?'blocked':status==='done'?'done':days!==null&&days<0?'overdue':t.priority==='1'?'prio':'';
+
+  return `<div class="kcard ${cls}" onclick="openModal(${t.id})">
+    <div class="kcard-name">${t.name}</div>
+    <div class="status-pill sm" style="background:${statusObj.color}22;color:${statusObj.color};border:1px solid ${statusObj.color}44;margin-bottom:6px;">${statusObj.label}</div>
+    ${dl?`<div class="kcard-date ${dc}">${fmtDate(dl)}</div>`:''}
+    ${loc.responsable?`<div class="kcard-resp">${loc.responsable}</div>`:''}
+    <div class="kcard-foot">
+      <div class="ksub ${sub>0?'has':''}">${sub>0?'✓ '+sub:'—'}</div>
+      ${loc.notas?'<span style="font-size:10px;color:var(--muted2);">✎</span>':''}
+    </div>
+  </div>`;
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+window.openModal = taskId => {
+  editingTask = allTasks.find(t=>t.id===taskId);
+  if (!editingTask) return;
+  const t = editingTask;
+  const loc = getLocal(t.id);
+
+  document.getElementById('m-title').textContent = t.name;
+  document.getElementById('m-stage').textContent = t.stage_id?.[1]||'—';
+  document.getElementById('m-proj').textContent = t.project_id?.[1]||'—';
+
+  // Info de Odoo (solo lectura)
+  const odooDl = t.date_deadline ? new Date(t.date_deadline) : null;
+  document.getElementById('m-odoo-deadline').textContent = odooDl ? fmtDateLong(odooDl) : '—';
+  const sub = t.subtask_count||(t.child_ids?.length)||0;
+  document.getElementById('m-sub').textContent = sub>0?`${sub} subtarea${sub>1?'s':''}` : '—';
+  document.getElementById('m-prio').textContent = t.priority==='1'?'⭐ Alta':'Normal';
+
+  // Campos editables (de Firebase)
+  document.getElementById('m-status').value = loc.status||'pending';
+  document.getElementById('m-deadline').value = loc.deadline ? loc.deadline.split(' ')[0].split('T')[0] : '';
+  document.getElementById('m-responsable').value = loc.responsable||'';
+  document.getElementById('m-notas').value = loc.notas||'';
+
+  document.getElementById('overlay').classList.add('open');
+};
+
+window.closeModal = e => {
+  if (!e || e.target===document.getElementById('overlay')) {
+    document.getElementById('overlay').classList.remove('open');
+    editingTask = null;
+  }
+};
+
+window.guardarLocal = async () => {
+  if (!editingTask) return;
+  const btn = document.getElementById('save-btn');
+  btn.disabled=true; btn.textContent='Guardando...';
+  try {
+    const fields = {
+      status: document.getElementById('m-status').value,
+      deadline: document.getElementById('m-deadline').value || null,
+      responsable: document.getElementById('m-responsable').value.trim(),
+      notas: document.getElementById('m-notas').value.trim(),
+    };
+    await saveLocalTask(editingTask.id, fields);
+    renderProject();
+    window.closeModal();
+    showToast('Guardado ✓');
+  } catch(e) { showToast('Error: '+e.message, true); }
+  finally { btn.disabled=false; btn.textContent='Guardar'; }
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+window.switchView = (name, tab) => {
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('view-'+name).classList.add('active');
+  tab.classList.add('active');
+};
+
+function getStageDotClass(name) {
+  const n=(name||'').toLowerCase();
+  if(n.includes('producción')||n.includes('produccion')) return 'sd-prod';
+  if(n.includes('diseño')||n.includes('desarrollo')) return 'sd-dd';
+  if(n.includes('post')||n.includes('después')||n.includes('despues')) return 'sd-post';
+  return 'sd-other';
+}
+
+function fmtDate(d) { return d.toLocaleDateString('es-AR',{day:'2-digit',month:'short'}); }
+function fmtDateLong(d) { return d.toLocaleDateString('es-AR',{day:'numeric',month:'long',year:'numeric'}); }
+
+function setSyncState(s) {
+  const dot=document.getElementById('sync-dot');
+  dot.className='sync-dot'+(s==='loading'?' loading':s==='error'?' error':'');
+}
+
+function showToast(msg, err=false) {
+  const el=document.getElementById('toast');
+  el.textContent=msg;
+  el.style.color=err?'var(--red)':'var(--accent)';
+  el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'),3000);
+}
+</script>
+<style>
+:root {
+  --bg:#0f0f0f;--surface:#181818;--surface2:#1f1f1f;
+  --border:#242424;--border2:#303030;
+  --text:#e8e6e0;--muted:#5a5856;--muted2:#787470;
+  --accent:#d4f14a;--green:#7ee8a2;--amber:#f4c25a;
+  --red:#f56b5c;--blue:#7ab8f5;--purple:#b8a0f0;
+  --mono:'DM Mono',monospace;--sans:'DM Sans',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;overflow:hidden;}
+
+/* LOGIN */
+#login-screen{display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:20px;}
+.login-card{background:var(--surface);border:1px solid var(--border2);border-radius:12px;padding:40px;text-align:center;max-width:340px;width:90%;}
+.login-logo{font-family:var(--mono);font-size:13px;letter-spacing:0.14em;color:var(--accent);margin-bottom:8px;}
+.login-sub{font-size:12px;color:var(--muted2);margin-bottom:28px;}
+.login-btn{width:100%;background:white;color:#1a1a1a;border:none;border-radius:8px;padding:11px;font-size:13px;font-weight:500;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:opacity .15s;}
+.login-btn:hover{opacity:.9;}
+.login-btn img{width:18px;height:18px;}
+
+/* APP */
+#app{display:none;grid-template-rows:48px 1fr;height:100vh;}
+header{display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--border);}
+.logo{font-family:var(--mono);font-size:12px;letter-spacing:0.14em;color:var(--accent);}
+.hright{display:flex;align-items:center;gap:12px;}
+.sync-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);}
+.sync-dot.error{background:var(--red);}
+.sync-dot.loading{background:var(--amber);animation:pulse 1s infinite;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.hbtn{font-family:var(--mono);font-size:11px;background:none;border:1px solid var(--border2);border-radius:4px;padding:4px 10px;color:var(--muted2);cursor:pointer;}
+.hbtn:hover{color:var(--text);border-color:var(--muted);}
+.user-chip{font-family:var(--mono);font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:6px;}
+
+/* BODY */
+.body{display:grid;grid-template-columns:210px 1fr;overflow:hidden;}
+aside{border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column;}
+aside::-webkit-scrollbar{width:3px;}
+aside::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px;}
+.aside-top{padding:10px 12px 6px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.aside-search{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;}
+.aside-search:focus{border-color:var(--border2);}
+.aside-label{font-family:var(--mono);font-size:9px;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase;padding:8px 12px 4px;}
+.proj-item{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;cursor:pointer;border-left:2px solid transparent;transition:all .1s;}
+.proj-item:hover{background:var(--surface);}
+.proj-item.active{background:var(--surface);border-left-color:var(--accent);}
+.proj-name{font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px;}
+.proj-item.active .proj-name{color:var(--accent);}
+.proj-badge{font-family:var(--mono);font-size:10px;color:var(--muted);background:var(--border);border-radius:3px;padding:1px 5px;flex-shrink:0;}
+
+/* CONTENT */
+.content{display:flex;flex-direction:column;overflow:hidden;}
+.proj-header{padding:12px 20px 0;flex-shrink:0;}
+.proj-title{font-size:15px;font-weight:500;margin-bottom:6px;}
+.proj-meta{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap;}
+.meta-chip{font-family:var(--mono);font-size:10px;color:var(--muted2);background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:3px 8px;}
+.meta-chip.ok{border-color:#3a5a1a;color:var(--green);}
+.meta-chip.warn{border-color:#5a3a0a;color:var(--amber);}
+.meta-chip.bad{border-color:#5a1a1a;color:var(--red);}
+
+.kpi-row{display:flex;border-bottom:1px solid var(--border);flex-shrink:0;}
+.kpi{padding:8px 16px;border-right:1px solid var(--border);}
+.kpi-val{font-family:var(--mono);font-size:17px;color:var(--text);}
+.kpi-val.g{color:var(--green);}
+.kpi-val.a{color:var(--amber);}
+.kpi-val.r{color:var(--red);}
+.kpi-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--muted);text-transform:uppercase;margin-top:1px;}
+
+.tabs{display:flex;border-bottom:1px solid var(--border);padding:0 20px;flex-shrink:0;}
+.tab{font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:10px 14px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;text-transform:uppercase;transition:all .15s;}
+.tab:hover{color:var(--text);}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent);}
+
+.stage-filter{display:flex;gap:5px;padding:8px 20px;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto;}
+.stage-filter::-webkit-scrollbar{display:none;}
+.sf-btn{font-family:var(--mono);font-size:10px;padding:3px 10px;border:1px solid var(--border2);border-radius:20px;color:var(--muted2);cursor:pointer;white-space:nowrap;background:none;transition:all .15s;}
+.sf-btn:hover{border-color:var(--muted);color:var(--text);}
+.sf-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(212,241,74,.06);}
+
+.view{display:none;flex:1;overflow:hidden;flex-direction:column;}
+.view.active{display:flex;}
+
+/* LISTA */
+.list-wrap{flex:1;overflow-y:auto;padding:12px 20px;}
+.list-wrap::-webkit-scrollbar{width:4px;}
+.list-wrap::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px;}
+.stage-group{margin-bottom:18px;}
+.stage-group-hdr{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
+.stage-dot{width:7px;height:7px;border-radius:2px;flex-shrink:0;}
+.sd-prod{background:var(--accent);}
+.sd-dd{background:var(--blue);}
+.sd-post{background:var(--purple);}
+.sd-other{background:var(--border2);}
+.stage-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted2);}
+.stage-cnt{font-family:var(--mono);font-size:9px;color:var(--muted);background:var(--border);border-radius:3px;padding:1px 5px;}
+
+.task-row{display:grid;grid-template-columns:1fr 100px 90px 80px 50px;gap:8px;align-items:center;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:3px;cursor:pointer;transition:border-color .1s;}
+.task-row:hover{border-color:var(--border2);}
+.task-row.prio{border-left:3px solid var(--amber);}
+.task-row.overdue{border-left:3px solid var(--red);}
+.task-row.done{border-left:3px solid var(--green);opacity:.7;}
+.task-row.blocked{border-left:3px solid var(--red);}
+.tname{font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:6px;}
+.has-note{font-size:10px;color:var(--muted2);}
+.tdates{font-family:var(--mono);font-size:10px;color:var(--muted2);}
+.tdates.overdue{color:var(--red);}
+.tdates.soon{color:var(--amber);}
+.tresp{font-size:11px;color:var(--muted2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tsub{font-family:var(--mono);font-size:10px;color:var(--muted2);text-align:right;}
+.tsub.has{color:var(--green);}
+
+.status-pill{font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:10px;white-space:nowrap;}
+.status-pill.sm{font-size:9px;padding:2px 6px;display:inline-block;}
+
+/* KANBAN */
+.kanban-wrap{flex:1;overflow-x:auto;overflow-y:hidden;padding:12px 20px;}
+.kanban{display:flex;gap:10px;height:100%;}
+.kcol{width:210px;flex-shrink:0;display:flex;flex-direction:column;}
+.kcol-hdr{margin-bottom:7px;}
+.kcol-title{font-family:var(--mono);font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted2);display:flex;align-items:center;justify-content:space-between;}
+.kcol-cnt{font-size:9px;background:var(--border);border-radius:3px;padding:1px 5px;color:var(--muted);}
+.kcol-bar{height:2px;border-radius:1px;margin-top:5px;}
+.bar-prod{background:var(--accent);}
+.bar-dd{background:var(--blue);}
+.bar-post{background:var(--purple);}
+.bar-other{background:var(--border2);}
+.kcol-body{flex:1;overflow-y:auto;padding-right:2px;}
+.kcol-body::-webkit-scrollbar{width:2px;}
+.kcol-body::-webkit-scrollbar-thumb{background:var(--border2);}
+.kcol-empty{font-family:var(--mono);font-size:10px;color:var(--muted);text-align:center;padding:10px;}
+.kcard{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:9px;margin-bottom:5px;cursor:pointer;transition:border-color .1s,transform .1s;}
+.kcard:hover{border-color:var(--border2);transform:translateY(-1px);}
+.kcard.prio{border-left:2px solid var(--amber);}
+.kcard.overdue{border-left:2px solid var(--red);}
+.kcard.done{border-left:2px solid var(--green);opacity:.7;}
+.kcard.blocked{border-left:2px solid var(--red);}
+.kcard-name{font-size:12px;color:var(--text);line-height:1.4;margin-bottom:5px;}
+.kcard-date{font-family:var(--mono);font-size:10px;color:var(--muted2);margin-bottom:4px;}
+.kcard-date.overdue{color:var(--red);}
+.kcard-date.soon{color:var(--amber);}
+.kcard-resp{font-size:10px;color:var(--muted2);margin-bottom:4px;}
+.kcard-foot{display:flex;align-items:center;justify-content:space-between;}
+.ksub{font-family:var(--mono);font-size:10px;color:var(--muted2);}
+.ksub.has{color:var(--green);}
+
+.empty{display:flex;align-items:center;justify-content:center;flex:1;flex-direction:column;gap:8px;color:var(--muted);font-family:var(--mono);font-size:11px;}
+.spinner{width:18px;height:18px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.no-proj{display:flex;align-items:center;justify-content:center;flex:1;flex-direction:column;gap:8px;color:var(--muted);}
+
+/* MODAL */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;z-index:100;align-items:center;justify-content:center;}
+.overlay.open{display:flex;}
+.modal{background:var(--surface2);border:1px solid var(--border2);border-radius:10px;width:500px;max-width:95vw;max-height:90vh;overflow-y:auto;}
+.modal-hdr{padding:16px 18px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;position:sticky;top:0;background:var(--surface2);z-index:1;}
+.modal-htitle{font-size:14px;font-weight:500;color:var(--text);line-height:1.4;}
+.modal-hmeta{font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:3px;}
+.close-btn{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;flex-shrink:0;padding:0 0 0 10px;}
+.modal-body{padding:14px 18px;}
+.modal-section{margin-bottom:16px;}
+.section-title{font-family:var(--mono);font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border);}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.info-item .lbl{font-family:var(--mono);font-size:9px;color:var(--muted);margin-bottom:2px;}
+.info-item .val{font-size:12px;color:var(--muted2);}
+.field-group{margin-bottom:12px;}
+.field-label{font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
+.field-input{width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:5px;color:var(--text);font-family:var(--sans);font-size:13px;padding:7px 10px;outline:none;transition:border-color .15s;}
+.field-input:focus{border-color:var(--accent);}
+.field-select{width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:5px;color:var(--text);font-family:var(--mono);font-size:11px;padding:7px 10px;cursor:pointer;outline:none;}
+.field-select:focus{border-color:var(--accent);}
+textarea.field-input{resize:vertical;min-height:70px;font-size:12px;}
+.field-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.save-btn{width:100%;background:var(--accent);border:none;border-radius:6px;color:#0f0f0f;font-family:var(--mono);font-size:11px;font-weight:500;padding:9px;cursor:pointer;margin-top:4px;letter-spacing:0.05em;transition:opacity .15s;}
+.save-btn:hover{opacity:.85;}
+.save-btn:disabled{opacity:.4;cursor:default;}
+.odoo-badge{font-family:var(--mono);font-size:9px;color:var(--muted);background:var(--border);border-radius:3px;padding:1px 6px;display:inline-block;margin-left:6px;}
+
+.toast{position:fixed;bottom:16px;right:16px;background:var(--surface2);border:1px solid var(--border2);border-radius:5px;padding:8px 14px;font-family:var(--mono);font-size:11px;color:var(--text);z-index:200;opacity:0;transition:opacity .2s;pointer-events:none;}
+.toast.show{opacity:1;}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">ANIMAL / PRODUCCIÓN</div>
+    <div class="login-sub">Tracker de taller conectado a Odoo</div>
+    <button class="login-btn" onclick="loginGoogle()">
+      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google">
+      Ingresar con Google
+    </button>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app">
+  <header>
+    <div class="logo">ANIMAL / PRODUCCIÓN</div>
+    <div class="hright">
+      <div class="sync-dot loading" id="sync-dot"></div>
+      <button class="hbtn" onclick="recargar()">↺ sync</button>
+      <div class="user-chip">
+        <span id="user-name"></span>
+        <button class="hbtn" onclick="logout()">salir</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="body">
+    <aside>
+      <div class="aside-top">
+        <input class="aside-search" type="text" placeholder="Buscar..." oninput="filtrarProyectos(this.value)">
+      </div>
+      <div class="aside-label">Proyectos</div>
+      <div id="proj-list"><div style="padding:10px 12px;font-family:var(--mono);font-size:10px;color:var(--muted);">Cargando...</div></div>
+    </aside>
+
+    <div class="content">
+      <div class="no-proj" id="no-proj">
+        <div style="font-size:28px;opacity:.2">⬡</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--muted);">Seleccioná un proyecto</div>
+      </div>
+
+      <div id="proj-view" style="display:none;flex:1;flex-direction:column;overflow:hidden;">
+        <div class="proj-header">
+          <div class="proj-title" id="pv-title"></div>
+          <div class="proj-meta" id="pv-meta"></div>
+        </div>
+        <div class="kpi-row">
+          <div class="kpi"><div class="kpi-val" id="k-total">0</div><div class="kpi-lbl">En producción</div></div>
+          <div class="kpi"><div class="kpi-val g" id="k-ok">0</div><div class="kpi-lbl">Listos</div></div>
+          <div class="kpi"><div class="kpi-val a" id="k-prog">0</div><div class="kpi-lbl">En curso</div></div>
+          <div class="kpi"><div class="kpi-val r" id="k-over">0</div><div class="kpi-lbl">Vencidos</div></div>
+        </div>
+        <div class="tabs">
+          <div class="tab active" onclick="switchView('list',this)">Lista</div>
+          <div class="tab" onclick="switchView('kanban',this)">Kanban</div>
+        </div>
+        <div class="stage-filter" id="stage-filter"></div>
+        <div class="view active" id="view-list">
+          <div class="list-wrap" id="list-body"></div>
+        </div>
+        <div class="view" id="view-kanban">
+          <div class="kanban-wrap"><div class="kanban" id="kanban-board"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL -->
+<div class="overlay" id="overlay" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-hdr">
+      <div style="flex:1;min-width:0;">
+        <div class="modal-htitle" id="m-title"></div>
+        <div class="modal-hmeta"><span id="m-stage"></span> · <span id="m-proj"></span></div>
+      </div>
+      <button class="close-btn" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="modal-section">
+        <div class="section-title">Info de Odoo <span class="odoo-badge">solo lectura</span></div>
+        <div class="info-grid">
+          <div class="info-item"><div class="lbl">Fecha límite (Odoo)</div><div class="val" id="m-odoo-deadline">—</div></div>
+          <div class="info-item"><div class="lbl">Prioridad (Odoo)</div><div class="val" id="m-prio">—</div></div>
+          <div class="info-item"><div class="lbl">Subtareas</div><div class="val" id="m-sub">—</div></div>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <div class="section-title">Datos de producción <span class="odoo-badge" style="background:rgba(212,241,74,.1);color:var(--accent);border:1px solid rgba(212,241,74,.2);">editable</span></div>
+        <div class="field-group">
+          <div class="field-label">Estado de producción</div>
+          <select class="field-select" id="m-status">
+            <option value="pending">Pendiente</option>
+            <option value="in_progress">En proceso</option>
+            <option value="done">Listo</option>
+            <option value="blocked">Bloqueado</option>
+          </select>
+        </div>
+        <div class="field-row">
+          <div class="field-group">
+            <div class="field-label">Fecha de entrega estimada</div>
+            <input class="field-input" id="m-deadline" type="date">
+          </div>
+          <div class="field-group">
+            <div class="field-label">Responsable de taller</div>
+            <input class="field-input" id="m-responsable" type="text" placeholder="Nombre...">
+          </div>
+        </div>
+        <div class="field-group">
+          <div class="field-label">Notas internas de producción</div>
+          <textarea class="field-input" id="m-notas" placeholder="Observaciones, materiales, instrucciones..."></textarea>
+        </div>
+        <button class="save-btn" id="save-btn" onclick="guardarLocal()">Guardar</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+</body>
+</html>
