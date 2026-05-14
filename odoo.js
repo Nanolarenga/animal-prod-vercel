@@ -100,26 +100,28 @@ function parseXmlRpc(xml) {
   return parseValue();
 }
 
-export default async function handler(req, res) {
-  // CORS
+module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const { action, ...params } = req.body;
+    let body = req.body;
+    if (typeof body === 'string') body = JSON.parse(body);
+    const { action, ...params } = body;
     let result;
 
     if (action === 'get_projects') {
       result = await callOdoo('project.project', 'search_read', [[]], {
-        fields: ['id','name','task_count','last_update_status','partner_id','user_id'], limit: 100
+        fields: ['id','name','task_count','last_update_status','partner_id'], limit: 100
       });
     }
     else if (action === 'get_tasks') {
       const domain = params.project_id ? [['project_id','=',params.project_id]] : [];
       result = await callOdoo('project.task', 'search_read', [domain], {
         fields: ['id','name','stage_id','user_ids','date_deadline','project_id',
-                 'priority','child_ids','subtask_count','date_assign'], limit: 500
+                 'priority','child_ids','subtask_count'], limit: 500
       });
     }
     else if (action === 'get_stages') {
@@ -132,9 +134,8 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({ ok: true, data: result });
-
   } catch (err) {
     console.error('Odoo error:', err.message);
     return res.status(500).json({ ok: false, error: err.message });
   }
-}
+};

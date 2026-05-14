@@ -1,3 +1,11 @@
 {
-  "outputDirectory": "public"
+  "functions": {
+    "api/odoo.js": {
+      "runtime": "nodejs20.x"
+    }
+  },
+  "routes": [
+    { "src": "/api/odoo", "dest": "/api/odoo.js" },
+    { "src": "/(.*)", "dest": "/public/index.html" }
+  ]
 }
