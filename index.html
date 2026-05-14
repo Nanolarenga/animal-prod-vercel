@@ -149,6 +149,8 @@ function renderSidebar() {
   }).sort((a,b) => (parseInt(b.name)||0)-(parseInt(a.name)||0));
 
   if (searchQuery) projs = projs.filter(p=>(p.name||'').toLowerCase().includes(searchQuery.toLowerCase()));
+  // Nota: mostramos todos los proyectos numerados; el filtro "En producción" 
+  // dentro de cada proyecto ya oculta lo que no es producción
 
   el.innerHTML = projs.map(p => {
     const active = activeProjectId===p.id?'active':'';
@@ -197,9 +199,9 @@ function renderStageFilter() {
   const el = document.getElementById('stage-filter');
   const present = new Set(allTasks.map(t=>t.stage_id?.[0]).filter(Boolean));
   const stages = allStages.filter(s=>present.has(s.id));
-  let html = `<button class="sf-btn ${activeStageFilter==='all'?'active':''}" onclick="setFilter('all')">Todas</button>`;
-  html += `<button class="sf-btn ${activeStageFilter==='prod'?'active':''}" onclick="setFilter('prod')">En producción</button>`;
-  stages.forEach(s=>{ html+=`<button class="sf-btn ${activeStageFilter===s.id?'active':''}" onclick="setFilter(${s.id})">${s.name}</button>`; });
+  let html = `<button class="sf-btn ${activeStageFilter==='prod'?'active':''}" onclick="setFilter('prod')">Todas</button>`;
+  // Solo mostrar etapas de producción como filtros individuales
+  stages.filter(s => prodStageIds.has(s.id)).forEach(s=>{ html+=`<button class="sf-btn ${activeStageFilter===s.id?'active':''}" onclick="setFilter(${s.id})">${s.name}</button>`; });
   el.innerHTML = html;
 }
 
